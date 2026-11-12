@@ -29,7 +29,18 @@ impl AirPodsDevice {
     ) -> Self {
         info!("Creating new AirPodsDevice for {}", mac_address);
         let mut aacp_manager = AACPManager::new();
-        aacp_manager.connect(mac_address).await;
+        if !aacp_manager.connect(mac_address).await {
+            // No control channel: nothing below can work (every send would
+            // fail), and the tray must not claim the AirPods are connected.
+            return AirPodsDevice {
+                mac_address,
+                aacp_manager,
+                media_controller: Arc::new(Mutex::new(MediaController::new(
+                    mac_address.to_string(),
+                    local_mac,
+                ))),
+            };
+        }
 
         // let mut att_manager = ATTManager::new();
         // att_manager.connect(mac_address).await.expect("Failed to connect ATT");
@@ -82,12 +93,10 @@ impl AirPodsDevice {
             error!("Failed to request proximity keys: {}", e);
         }
 
-        let mut app_settings = crate::utils::AppSettings::load();
-        if app_settings.convo_restore_pending {
+        if crate::utils::AppSettings::load().convo_restore_pending {
             info!("Restoring conversation awareness left off by an interrupted mic capture");
             if aacp_manager.set_conversation_detection(true).await {
-                app_settings.convo_restore_pending = false;
-                app_settings.save();
+                crate::utils::AppSettings::update(|s| s.convo_restore_pending = false);
             }
         }
 
@@ -128,6 +137,32 @@ impl AirPodsDevice {
             handle
                 .update(|tray: &mut MyTray| tray.command_tx = Some(command_tx.clone()))
                 .await;
+        }
+
+        // When the connection ends, stop showing it: the tray would keep the
+        // last battery levels and a listening-mode menu that sends nowhere.
+        if let Some(handle) = tray_handle.clone() {
+            let aacp = aacp_manager.clone();
+            tokio::spawn(async move {
+                aacp.disconnected().await;
+                handle
+                    .update(|tray: &mut MyTray| {
+                        tray.connected = false;
+                        tray.battery_headphone = None;
+                        tray.battery_headphone_status = None;
+                        tray.battery_l = None;
+                        tray.battery_l_status = None;
+                        tray.battery_r = None;
+                        tray.battery_r_status = None;
+                        tray.battery_c = None;
+                        tray.battery_c_status = None;
+                        tray.listening_mode = None;
+                        tray.allow_off_option = None;
+                        tray.conversation_detect_enabled = None;
+                        tray.command_tx = None;
+                    })
+                    .await;
+            });
         }
 
         let aacp_manager_clone = aacp_manager.clone();
